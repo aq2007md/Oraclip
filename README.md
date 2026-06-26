@@ -14,7 +14,7 @@ The pacing?
 The energy?
 Or maybe just the content itself, you have no idea
 And like most creators, you quit before you ever understand how to be viral.
-My name is André, I’m 18 and after generating more than 100 millions views with the best content creators in the market, I realized that:
+After generating more than 100 millions views with the best content creators in the market, I realized that:
 Creators don’t need more editing tools for quality.
 They need clarity.
 
