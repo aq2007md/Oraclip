@@ -1,0 +1,80 @@
+## Account Center Build Plan
+
+A protected `/account/*` section with 5 pages, header dropdown, and a shared sidebar/tab nav.
+
+### 1. Database migration (show first, apply on approval)
+
+New table `connection_waitlist`:
+- `id uuid PK default gen_random_uuid()`
+- `user_id uuid not null` (references auth.users via RLS check, no FK to auth.users)
+- `platform text not null check (platform in ('instagram','tiktok','youtube','facebook'))`
+- `created_at timestamptz default now()`
+- `unique(user_id, platform)`
+- RLS: select/insert own rows (`user_id = auth.uid()`)
+
+### 2. Header dropdown
+Update the existing app header (in `src/routes/app.tsx` or shared header component — will inspect first):
+- Add an avatar circle (initial from `display_name`) left of the name
+- Wrap in `DropdownMenu` from `@/components/ui/dropdown-menu`
+- 5 nav items + divider + Sign out (reuses existing signOut)
+
+### 3. Shared `/account` layout
+Create `src/routes/account.tsx` as a layout route:
+- Auth gate in `beforeLoad` (redirect to `/login` if no session)
+- Renders the same app header (extract into `src/components/AppHeader.tsx` so `/app` and `/account/*` share it)
+- Sidebar nav (200px) on desktop, sticky horizontal tabs on mobile
+- `<Outlet />` for child pages
+
+### 4. Pages
+
+**`src/routes/account.index.tsx` — Overview**
+- Welcome heading using profile.display_name
+- Mint plan badge from `profile.subscription_tier`
+- 3 stat cards: count, avg, max from `simulation_runs` joined to `content_submissions` filtered by org + 30d
+- 3 recent simulation cards (link to `/account/history?expand=<id>`)
+- Quick actions 2x2 (hide upgrade card if not free)
+
+**`src/routes/account.history.tsx`**
+- Filters (platform, goal, sort) — client-side after one fetch
+- Expandable rows; expanded reuses existing cards: `ViralityScoreCard`, `EstimatedReachCard`, `AudienceResponseCard`, `RecommendationsCard`, `ReferencePatternsCard`, `SimilarReferencesCard`
+- Fetch run + child rows (audience_reactions, recommendations, reference_patterns, similar_references) on expand
+- "Re-run" button → `/app?submission_id=<id>` (no deep prefill yet)
+- Free-tier 30-day cap muted block at bottom
+- Empty state CTA → `/app`
+- Honors `?expand=<id>` from overview
+
+**`src/routes/account.profile.tsx`**
+- Single-page form mirroring onboarding fields (uses `src/lib/onboarding-options.ts`)
+- Display name editable; email read-only with placeholder "Change email" link
+- Save updates `profiles` row, sonner toast on success
+
+**`src/routes/account.plan.tsx`**
+- Current plan card: name, description, usage progress (count vs tier limit), reset countdown for Free / "Next billing" placeholder for paid
+- 4 mini tier cards (reuse pricing data); current tier marked with "Current" badge
+- Other tiers link to `/checkout/$tier`
+- Billing history placeholder block
+
+**`src/routes/account.connections.tsx`**
+- 4 platform cards (Instagram, TikTok, YouTube, Facebook) with lucide icons
+- On mount fetch existing waitlist rows for the user
+- "Join waitlist" inserts to `connection_waitlist`; button flips to "On waitlist ✓" disabled
+- Disclaimer footer
+
+### 5. Routing notes
+- TanStack file-based: `account.tsx` (layout) + `account.index.tsx`, `account.history.tsx`, etc.
+- All wrapped via auth check in the layout `beforeLoad`
+- Sidebar built with simple `<Link activeProps={{...}}>` (no shadcn Sidebar provider needed — simpler and matches request)
+
+### 6. Reuse / no-touch
+- Will NOT modify any existing card components or `/app` page logic
+- Will extract header into `AppHeader.tsx` and update `/app` to use it (minor, no behavior change beyond adding the dropdown)
+
+### Out of scope (per your DON'Ts)
+Real OAuth, Stripe portal, email change, delete account, notifications, history search, deep re-run prefill.
+
+### Order of execution
+1. Create migration (await your approval)
+2. Build `AppHeader` + dropdown, swap into `/app`
+3. Build `/account` layout with sidebar/tabs
+4. Build 5 child pages
+5. Verify via build output

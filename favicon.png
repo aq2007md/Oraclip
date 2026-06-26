@@ -1,0 +1,39 @@
+DO $$
+DECLARE
+  _uid UUID := gen_random_uuid();
+  _org RECORD;
+  _mem RECORD;
+  _prof RECORD;
+BEGIN
+  INSERT INTO auth.users (id, instance_id, email, raw_user_meta_data, aud, role, created_at, updated_at, email_confirmed_at)
+  VALUES (_uid, '00000000-0000-0000-0000-000000000000', 'smoke+'||_uid||'@oraclip.test',
+          jsonb_build_object('display_name','Smoke Test'),
+          'authenticated','authenticated', now(), now(), now());
+
+  SELECT id, name, type, plan, seat_count, created_by INTO _org
+  FROM public.organizations WHERE created_by = _uid;
+  RAISE NOTICE 'ORG  -> id=% name=% type=% plan=% seats=% created_by=%',
+    _org.id, _org.name, _org.type, _org.plan, _org.seat_count, _org.created_by;
+
+  SELECT organization_id, user_id, role, accepted_at IS NOT NULL AS accepted INTO _mem
+  FROM public.organization_members WHERE user_id = _uid;
+  RAISE NOTICE 'MEMBER -> org=% user=% role=% accepted=%',
+    _mem.organization_id, _mem.user_id, _mem.role, _mem.accepted;
+
+  SELECT id, display_name, default_organization_id INTO _prof
+  FROM public.profiles WHERE id = _uid;
+  RAISE NOTICE 'PROFILE -> id=% display_name=% default_org=%',
+    _prof.id, _prof.display_name, _prof.default_organization_id;
+
+  IF _prof.default_organization_id <> _org.id THEN
+    RAISE EXCEPTION 'profile.default_organization_id does not match created org';
+  END IF;
+
+  -- Cleanup. Org has no submissions, owner is being deleted, so personal-org guard allows soft-delete only after user gone.
+  DELETE FROM public.organization_members WHERE user_id = _uid;
+  DELETE FROM public.profiles WHERE id = _uid;
+  DELETE FROM public.organizations WHERE id = _org.id;
+  DELETE FROM auth.users WHERE id = _uid;
+
+  RAISE NOTICE 'SMOKE TEST PASSED + cleaned up';
+END $$;

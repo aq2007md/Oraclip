@@ -1,0 +1,57 @@
+import { createFileRoute, Link, useParams } from "@tanstack/react-router";
+import { ArrowLeft } from "lucide-react";
+
+export const Route = createFileRoute("/checkout/$tier")({
+  component: CheckoutStub,
+  head: () => ({
+    meta: [{ title: "Checkout — Oraclip" }],
+  }),
+});
+
+const TIER_LABELS: Record<string, string> = {
+  free: "Free",
+  creator: "Creator",
+  pro: "Pro",
+  agency: "Agency",
+};
+
+function CheckoutStub() {
+  const { tier } = useParams({ from: "/checkout/$tier" });
+  const label = TIER_LABELS[tier] ?? tier;
+
+  return (
+    <main
+      className="flex min-h-screen items-center justify-center px-6"
+      style={{ background: "var(--teal-deep)", color: "var(--teal-foreground)" }}
+    >
+      <div
+        className="w-full max-w-md rounded-2xl border p-10 text-center"
+        style={{
+          borderColor: "color-mix(in oklab, var(--mint) 25%, transparent)",
+          background: "color-mix(in oklab, var(--mint) 4%, transparent)",
+        }}
+      >
+        <div
+          className="mx-auto mb-4 inline-block rounded-full px-3 py-1 text-xs font-medium"
+          style={{
+            background: "color-mix(in oklab, var(--mint) 15%, transparent)",
+            color: "var(--mint)",
+          }}
+        >
+          {label} plan
+        </div>
+        <h1 className="text-2xl font-bold tracking-tight">Checkout coming soon.</h1>
+        <p className="mt-3 text-sm" style={{ opacity: 0.75 }}>
+          We're finalizing payment integration — your spot in {label} is reserved.
+        </p>
+        <Link
+          to="/pricing"
+          className="mt-8 inline-flex items-center gap-2 rounded-full border px-5 py-2.5 text-sm font-medium transition-colors hover:bg-white/5"
+          style={{ borderColor: "color-mix(in oklab, var(--mint) 35%, transparent)" }}
+        >
+          <ArrowLeft className="h-4 w-4" /> Back to pricing
+        </Link>
+      </div>
+    </main>
+  );
+}

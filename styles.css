@@ -1,0 +1,780 @@
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
+import {
+  ContentUploader,
+  type UploaderResult,
+  type TargetPlatform,
+  type Goal,
+} from "@/components/ContentUploader";
+import { AppHeader } from "@/components/AppHeader";
+import { ViralityScoreCard, type Confidence } from "@/components/ViralityScoreCard";
+import { EstimatedReachCard } from "@/components/EstimatedReachCard";
+import {
+  AudienceResponseCard,
+  type Persona,
+  type Sentiment,
+  type MetricTile,
+} from "@/components/AudienceResponseCard";
+import {
+  RecommendationsCard,
+  type StoredRecommendation,
+} from "@/components/RecommendationsCard";
+import {
+  SimilarReferencesCard,
+  type SimilarReference,
+} from "@/components/SimilarReferencesCard";
+import {
+  ReferencePatternsCard,
+  type ReferencePattern,
+} from "@/components/ReferencePatternsCard";
+import { generateRecommendations } from "@/lib/recommendations";
+import { generateSimilarReferences } from "@/lib/similar-references";
+import { generateReferencePatterns } from "@/lib/reference-patterns";
+import { useAuth } from "@/components/AuthProvider";
+import { audienceTagsForCreatorType } from "@/lib/onboarding-options";
+import { Button } from "@/components/ui/button";
+import { supabase } from "@/integrations/supabase/client";
+import { Loader2, FileVideo } from "lucide-react";
+
+export const Route = createFileRoute("/app")({
+  component: Index,
+});
+
+const VERDICTS = [
+  "Likely to perform well in your niche",
+  "Average reach expected",
+  "Strong viral potential",
+  "May underperform — see recommendations",
+] as const;
+
+function confidenceForScore(score: number): Confidence {
+  if (score >= 80) return "high";
+  if (score >= 50) return "medium";
+  return "low";
+}
+
+const PLATFORM_LABELS: Record<TargetPlatform, string> = {
+  tiktok: "TikTok",
+  instagram: "Instagram (Reels)",
+  youtube: "YouTube Shorts",
+  facebook: "Facebook (Reels)",
+};
+
+const AUDIENCE_TAG_LABELS: Record<string, string> = {
+  gen_z: "Gen Z",
+  millennials: "Millennials",
+  gen_x: "Gen X",
+  boomers: "Boomers",
+  students: "students",
+  parents: "parents",
+  professionals: "professionals",
+  independent_creators: "independent creators",
+  smes: "SMEs",
+  enterprises: "enterprises",
+  consumers_b2c: "consumers",
+  businesses_b2b: "B2B audiences",
+  niche_hobbyists: "niche hobbyists",
+};
+
+type Phase =
+  | { kind: "idle" }
+  | { kind: "submitting"; payload: UploaderResult }
+  | {
+      kind: "result";
+      payload: UploaderResult;
+      score: number;
+      verdict: string;
+      confidence: Confidence;
+      reachLow: number;
+      reachHigh: number;
+      metrics: MetricTile[];
+      personas: Persona[];
+      recommendations: StoredRecommendation[];
+      similarReferences: SimilarReference[];
+      patterns: ReferencePattern[];
+    };
+
+function pick<T>(arr: readonly T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function roundReach(n: number): number {
+  if (n < 10_000) return Math.round(n / 500) * 500;
+  if (n < 100_000) return Math.round(n / 1_000) * 1_000;
+  if (n < 1_000_000) return Math.round(n / 5_000) * 5_000;
+  return Math.round(n / 50_000) * 50_000;
+}
+
+const PLATFORM_REACH_MULTIPLIER: Record<TargetPlatform, number> = {
+  tiktok: 1.2,
+  instagram: 1.0,
+  youtube: 1.1,
+  facebook: 0.7,
+};
+
+/**
+ * Hockey-stick reach curve, fitted to the anchor table:
+ *   0→200, 20→800, 40→3.5K, 60→10K, 75→50K, 85→250K, 92→800K, 97→2M, 100→5M.
+ * Low segment (s ≤ 60): power curve f(s)=200 + 0.2953·s^2.542 (matches the
+ *   200/800/10K anchors; "roughly linear" visually, harder than pure linear).
+ * High segment (s > 60): exponential 10K · 500^(t^1.35), t=(s-60)/40, so
+ *   t=1 lands exactly on 5M.
+ */
+function viewsFromScore(score: number): number {
+  const s = Math.max(0, Math.min(100, score));
+  if (s <= 60) {
+    return 200 + 0.2953 * Math.pow(s, 2.542);
+  }
+  const t = (s - 60) / 40;
+  return 10_000 * Math.pow(500, Math.pow(t, 1.35));
+}
+
+function reachRangeForScore(
+  score: number,
+  platform: TargetPlatform,
+): { low: number; high: number } {
+  const base = viewsFromScore(score) * PLATFORM_REACH_MULTIPLIER[platform];
+  const low = roundReach(base * 0.75);
+  const high = Math.max(low, roundReach(base * 1.25));
+  return { low, high };
+}
+
+// ---------- Mock metric / persona generation ----------
+
+function formatNum(n: number): string {
+  if (n >= 1_000_000) {
+    const v = n / 1_000_000;
+    return `${v >= 10 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, "")}M`;
+  }
+  if (n >= 1_000) {
+    const v = n / 1_000;
+    return `${v >= 10 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, "")}K`;
+  }
+  return `${Math.round(n)}`;
+}
+
+function rangeAround(mid: number, spread = 0.25): { low: number; high: number } {
+  return {
+    low: Math.max(0, Math.round(mid * (1 - spread))),
+    high: Math.round(mid * (1 + spread)),
+  };
+}
+
+function tile(label: string, mid: number): MetricTile {
+  const { low, high } = rangeAround(mid);
+  return {
+    label,
+    value: formatNum(mid),
+    range: `${formatNum(low)} – ${formatNum(high)}`,
+  };
+}
+
+function pctTile(label: string, midPct: number): MetricTile {
+  const lo = Math.max(0, midPct - 1.5);
+  const hi = midPct + 1.5;
+  return {
+    label,
+    value: `${midPct.toFixed(1)}%`,
+    range: `${lo.toFixed(1)}% – ${hi.toFixed(1)}%`,
+  };
+}
+
+/** scoreFactor scales numbers up with virality score. */
+function scoreFactor(score: number): number {
+  // 35 -> ~0.5, 60 -> ~1.0, 85 -> ~1.6
+  return 0.4 + (score / 100) * 1.4;
+}
+
+function generateMetrics(goal: Goal | null, score: number, reachMid: number): MetricTile[] {
+  const f = scoreFactor(score);
+  switch (goal) {
+    case "reach":
+      return [
+        tile("Views", Math.round(reachMid)),
+        tile("Reach beyond followers", Math.round(reachMid * 0.55)),
+        tile("Avg watch time", Math.round(8 + 12 * f)), // seconds
+      ];
+    case "followers":
+      return [
+        tile("New followers", Math.round(120 * f)),
+        tile("Profile visits", Math.round(900 * f)),
+        pctTile("Follow-through rate", 1.2 + 4.5 * f),
+      ];
+    case "engagement":
+      return [
+        tile("Likes", Math.round(reachMid * 0.06 * f)),
+        tile("Comments", Math.round(reachMid * 0.005 * f)),
+        tile("Shares", Math.round(reachMid * 0.012 * f)),
+        tile("Saves", Math.round(reachMid * 0.008 * f)),
+      ];
+    case "leads":
+      return [
+        tile("Profile visits", Math.round(900 * f)),
+        tile("Link clicks", Math.round(180 * f)),
+        tile("DM inquiries", Math.round(14 * f)),
+      ];
+    case "awareness":
+      return [
+        tile("Reach", Math.round(reachMid)),
+        tile("Impressions", Math.round(reachMid * 1.6)),
+        pctTile("Brand mention lift", 0.3 + 2.8 * f),
+      ];
+    case "traffic":
+      return [
+        tile("Link clicks", Math.round(220 * f)),
+        pctTile("CTR", 0.6 + 2.4 * f),
+        pctTile("Bounce indicator", 70 - 20 * (f - 0.5)),
+      ];
+    default: // 'other' or null -> default to engagement
+      return [
+        tile("Likes", Math.round(reachMid * 0.06 * f)),
+        tile("Comments", Math.round(reachMid * 0.005 * f)),
+        tile("Shares", Math.round(reachMid * 0.012 * f)),
+        tile("Saves", Math.round(reachMid * 0.008 * f)),
+      ];
+  }
+}
+
+// ---------- Persona generation ----------
+
+const PERSONA_NAMES = [
+  "Maya",
+  "Léo",
+  "Aïcha",
+  "Tom",
+  "Sofia",
+  "Hugo",
+  "Zoe",
+  "Noah",
+  "Camille",
+  "Kenji",
+];
+
+const AGE_RANGES = ["18-22", "22-25", "26-30", "31-38", "39-46", "47-55"];
+
+function sentimentDistribution(score: number): Sentiment[] {
+  if (score >= 70) {
+    return ["positive", "positive", "positive", "positive", "neutral", "neutral"];
+  }
+  if (score >= 40) {
+    return ["positive", "positive", "neutral", "neutral", "neutral", "negative"];
+  }
+  return ["positive", "neutral", "neutral", "negative", "negative", "negative"];
+}
+
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function audienceKeywords(payload: UploaderResult): string[] {
+  const words: string[] = [];
+  if (payload.audienceDescription) {
+    // Pull noteworthy lowercase words >3 chars.
+    const cleaned = payload.audienceDescription
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 3);
+    words.push(...cleaned.slice(0, 8));
+  }
+  if (payload.audienceTags) {
+    for (const t of payload.audienceTags) {
+      words.push(AUDIENCE_TAG_LABELS[t] ?? t);
+    }
+  }
+  return Array.from(new Set(words));
+}
+
+function describePersona(keywords: string[], i: number): string {
+  if (keywords.length === 0) {
+    const fallbacks = [
+      "Active social media user who follows trending creators.",
+      "Casual scroller, watches Reels during commutes.",
+      "Engaged community member, comments often on niche content.",
+      "Discovers new creators through the For You page.",
+      "Mostly watches, rarely interacts unless content stands out.",
+      "Shares videos with friends when they hit emotionally.",
+    ];
+    return fallbacks[i % fallbacks.length];
+  }
+  const kw = keywords[i % keywords.length];
+  const kw2 = keywords[(i + 1) % keywords.length];
+  const templates = [
+    `Identifies with ${kw} content and follows creators in that space.`,
+    `Looks for ${kw} videos that feel authentic, not promotional.`,
+    `Part of the ${kw} crowd; resonates with ${kw2} themes.`,
+    `Daily viewer of ${kw}-related content on social.`,
+    `Drawn to ${kw} stories with a clear point of view.`,
+    `Casual fan of ${kw} content; will watch if the hook lands.`,
+  ];
+  return templates[i % templates.length];
+}
+
+function quoteFor(sentiment: Sentiment, i: number): string {
+  const positives = [
+    "Okay this is exactly what I needed today, saving it.",
+    "Sending this to my group chat right now.",
+    "The pacing is so good — watched it twice.",
+    "Finally someone said it. Following.",
+  ];
+  const neutrals = [
+    "Not bad, but I've seen this take before.",
+    "Decent video. Wouldn't share it though.",
+    "Curious where this goes — might come back.",
+    "Watched to the end out of curiosity.",
+  ];
+  const negatives = [
+    "Scrolled past after two seconds, hook didn't land.",
+    "Feels like an ad. Not for me.",
+    "I don't get the point of this one.",
+    "Too long, lost interest halfway.",
+  ];
+  if (sentiment === "positive") return positives[i % positives.length];
+  if (sentiment === "neutral") return neutrals[i % neutrals.length];
+  return negatives[i % negatives.length];
+}
+
+function generatePersonas(score: number, payload: UploaderResult): Persona[] {
+  const sentiments = sentimentDistribution(score);
+  const names = shuffle(PERSONA_NAMES).slice(0, 6);
+  const ages = shuffle(AGE_RANGES).slice(0, 6);
+  const keywords = audienceKeywords(payload);
+
+  return sentiments.map((sentiment, i) => ({
+    name: names[i],
+    age_range: ages[i],
+    description: describePersona(keywords, i),
+    quote: quoteFor(sentiment, i),
+    sentiment,
+  }));
+}
+
+// ---------- Component ----------
+
+function Index() {
+  const { user, profile, loading, signOut } = useAuth();
+  const navigate = useNavigate();
+  const [phase, setPhase] = useState<Phase>({ kind: "idle" });
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (loading) return;
+    if (!user) {
+      navigate({ to: "/login" });
+      return;
+    }
+    // Wait for profile to load before deciding. Only redirect if profile
+    // is loaded AND onboarding is incomplete.
+    if (profile && !profile.onboarding_completed_at) {
+      navigate({ to: "/onboarding" });
+    }
+  }, [loading, user, profile, navigate]);
+
+  const handleSignOut = async () => {
+    await signOut();
+    navigate({ to: "/" });
+  };
+
+  // Show loading screen until we know whether the user has completed onboarding.
+  // Without this, the page briefly renders before the profile-aware redirect fires.
+  if (loading || !user || !profile || !profile.onboarding_completed_at) {
+    return (
+      <main
+        className="flex min-h-screen items-center justify-center"
+        style={{ background: "var(--teal-deep)", color: "var(--teal-foreground)" }}
+      >
+        <p className="text-sm" style={{ opacity: 0.6 }}>Loading…</p>
+      </main>
+    );
+  }
+
+  const handleSubmit = async (payload: UploaderResult) => {
+    setError(null);
+    if (!profile?.default_organization_id) {
+      setError("Your workspace is still being set up. Try again in a moment.");
+      return;
+    }
+
+    setPhase({ kind: "submitting", payload });
+
+    // 1. Insert content_submissions row (with new goal/audience fields)
+    const { data: submission, error: submissionError } = await supabase
+      .from("content_submissions")
+      .insert({
+        organization_id: profile.default_organization_id,
+        created_by_user_id: user.id,
+        target_platform: payload.platform,
+        media_url: payload.mediaPath,
+        media_size_bytes: payload.sizeBytes,
+        media_duration_seconds: payload.durationSeconds ?? null,
+        caption: payload.caption ?? null,
+        script: payload.script ?? null,
+        goal: payload.goal ?? null,
+        goal_custom: payload.goalCustom ?? null,
+        audience_description: payload.audienceDescription ?? null,
+        audience_tags: payload.audienceTags ?? null,
+      })
+      .select("id")
+      .single();
+
+    if (submissionError || !submission) {
+      console.error("[submission insert]", submissionError);
+      setError(submissionError?.message ?? "Could not save your submission.");
+      setPhase({ kind: "idle" });
+      return;
+    }
+
+    // 2. Fake API latency
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // 3. Mock results
+    const score = Math.floor(Math.random() * (85 - 35 + 1)) + 35;
+    const verdict = pick(VERDICTS);
+    const confidence = confidenceForScore(score);
+    const { low: reachLow, high: reachHigh } = reachRangeForScore(score, payload.platform);
+    const reachMid = (reachLow + reachHigh) / 2;
+    const metrics = generateMetrics(payload.goal ?? null, score, reachMid);
+    const personas = generatePersonas(score, payload);
+    const recsToInsert = generateRecommendations({
+      platform: payload.platform,
+      goal: payload.goal ?? null,
+      scriptLength: payload.script?.length ?? 0,
+      captionLength: payload.caption?.length ?? 0,
+      durationSeconds: payload.durationSeconds ?? null,
+      audienceTags: payload.audienceTags ?? [],
+      audienceDescription: payload.audienceDescription ?? null,
+    });
+
+    // 4. Insert simulation_runs row (with full snapshot)
+    const { data: run, error: runError } = await supabase
+      .from("simulation_runs")
+      .insert({
+        submission_id: submission.id,
+        triggered_by_user_id: user.id,
+        status: "succeeded",
+        virality_score: score,
+        confidence,
+        reach_low: reachLow,
+        reach_high: reachHigh,
+        generated_at: new Date().toISOString(),
+        submission_snapshot: {
+          caption: payload.caption ?? null,
+          script: payload.script ?? null,
+          target_platform: payload.platform,
+          media_url: payload.mediaPath,
+          goal: payload.goal ?? null,
+          goal_custom: payload.goalCustom ?? null,
+          audience_description: payload.audienceDescription ?? null,
+          audience_tags: payload.audienceTags ?? null,
+        },
+      })
+      .select("id")
+      .single();
+
+    let recommendations: StoredRecommendation[] = [];
+    let similarReferences: SimilarReference[] = [];
+    let patterns: ReferencePattern[] = [];
+
+    if (runError || !run) {
+      console.error("[simulation_runs insert]", runError);
+    } else {
+      // 5. Persist personas
+      const reactionRows = personas.map((p) => ({
+        run_id: run.id,
+        persona_label: p.name,
+        age_range: p.age_range,
+        sentiment_label: p.sentiment,
+        persona_description: p.description,
+        reaction_text: p.quote,
+      }));
+      const { error: reactionError } = await supabase
+        .from("audience_reactions")
+        .insert(reactionRows);
+      if (reactionError) {
+        console.error("[audience_reactions insert]", reactionError);
+      }
+
+      // 6. Persist recommendations
+      const recRows = recsToInsert.map((r, i) => ({
+        run_id: run.id,
+        category: r.category,
+        title: r.title,
+        detail: r.detail,
+        suggestion: r.title, // legacy NOT NULL column
+        predicted_lift: r.predicted_lift,
+        predicted_score_lift: r.predicted_lift,
+        sort_order: i,
+        priority: i,
+      }));
+      const { data: insertedRecs, error: recError } = await supabase
+        .from("recommendations")
+        .insert(recRows)
+        .select("id, category, title, detail, predicted_lift, is_done");
+      if (recError) {
+        console.error("[recommendations insert]", recError);
+      } else if (insertedRecs) {
+        recommendations = insertedRecs.map((r) => ({
+          id: r.id,
+          category: r.category as StoredRecommendation["category"],
+          title: r.title ?? "",
+          detail: r.detail ?? "",
+          predicted_lift: r.predicted_lift ?? 0,
+          is_done: r.is_done ?? false,
+        }));
+      }
+
+      // 7. Generate + persist similar references
+      const refSeeds = generateSimilarReferences({
+        platform: payload.platform,
+        goal: payload.goal ?? null,
+        audienceDescription: payload.audienceDescription ?? null,
+        audienceTags: payload.audienceTags ?? [],
+      });
+      const refRows = refSeeds.map((r) => ({
+        run_id: run.id,
+        platform: r.platform,
+        reference_title: r.title,
+        creator_handle: r.creator_handle,
+        view_count: r.view_count,
+        reasoning: r.reason,
+        thumbnail_seed: r.thumbnail_seed,
+        sort_order: r.sort_order,
+        reference_url: null,
+      }));
+      const { data: insertedRefs, error: refError } = await supabase
+        .from("similar_references")
+        .insert(refRows)
+        .select(
+          "id, platform, reference_title, creator_handle, view_count, reasoning, thumbnail_seed",
+        );
+      if (refError) {
+        console.error("[similar_references insert]", refError);
+        // Fall back to in-memory references so the UI still renders
+        similarReferences = refSeeds.map((r, i) => ({
+          id: `local-${i}`,
+          platform: r.platform,
+          title: r.title,
+          creator_handle: r.creator_handle,
+          view_count: r.view_count,
+          reason: r.reason,
+          thumbnail_seed: r.thumbnail_seed,
+        }));
+      } else if (insertedRefs) {
+        similarReferences = insertedRefs.map((r) => ({
+          id: r.id,
+          platform: (r.platform ?? refSeeds[0].platform) as SimilarReference["platform"],
+          title: r.reference_title ?? "",
+          creator_handle: r.creator_handle ?? "",
+          view_count: r.view_count ?? 0,
+          reason: r.reasoning ?? "",
+          thumbnail_seed: r.thumbnail_seed ?? "",
+        }));
+      }
+
+      // 8. Generate + persist reference patterns
+      const patternSeeds = generateReferencePatterns({
+        platform: payload.platform,
+        goal: payload.goal ?? null,
+      });
+      const patternRows = patternSeeds.map((p) => ({
+        run_id: run.id,
+        category: p.category,
+        title: p.title,
+        description: p.description,
+        match_status: p.match_status,
+        sort_order: p.sort_order,
+      }));
+      const { data: insertedPatterns, error: patternError } = await supabase
+        .from("reference_patterns")
+        .insert(patternRows)
+        .select("id, category, title, description, match_status");
+      if (patternError) {
+        console.error("[reference_patterns insert]", patternError);
+        patterns = patternSeeds.map((p, i) => ({
+          id: `local-pattern-${i}`,
+          category: p.category,
+          title: p.title,
+          description: p.description,
+          match_status: p.match_status,
+        }));
+      } else if (insertedPatterns) {
+        patterns = insertedPatterns.map((p) => ({
+          id: p.id,
+          category: p.category as ReferencePattern["category"],
+          title: p.title,
+          description: p.description,
+          match_status: p.match_status as ReferencePattern["match_status"],
+        }));
+      }
+    }
+
+    setPhase({
+      kind: "result",
+      payload,
+      score,
+      verdict,
+      confidence,
+      reachLow,
+      reachHigh,
+      metrics,
+      personas,
+      recommendations,
+      similarReferences,
+      patterns,
+    });
+  };
+
+  const reset = () => {
+    setError(null);
+    setPhase({ kind: "idle" });
+  };
+
+  const submitting = phase.kind === "submitting";
+  const showCollapsed = phase.kind !== "idle";
+  const activePayload =
+    phase.kind === "submitting" || phase.kind === "result" ? phase.payload : null;
+
+  return (
+    <main
+      className="relative min-h-screen"
+      style={{ background: "var(--teal-deep)", color: "var(--teal-foreground)" }}
+    >
+      {/* Soft ambient gradient — same treatment as landing hero, lower opacity */}
+      <div className="pointer-events-none absolute inset-0 overflow-hidden">
+        <div
+          className="absolute -left-32 -top-40 h-[500px] w-[500px] rounded-full blur-3xl"
+          style={{ background: "var(--mint)", opacity: 0.12 }}
+        />
+        <div
+          className="absolute -right-40 top-32 h-[600px] w-[600px] rounded-full blur-3xl"
+          style={{ background: "var(--mint)", opacity: 0.08 }}
+        />
+      </div>
+
+      <AppHeader />
+
+      <div className="relative z-10 mx-auto w-full max-w-6xl px-6 py-8 md:px-8">
+        {/* Top: collapsed submission strip OR uploader (centered, narrower) */}
+        <div className="mx-auto w-full max-w-2xl space-y-6">
+          {showCollapsed && activePayload ? (
+            <div
+              className="flex items-center gap-3 rounded-2xl border p-4"
+              style={{
+                background: "color-mix(in oklab, var(--mint) 4%, transparent)",
+                borderColor: "color-mix(in oklab, var(--mint) 18%, transparent)",
+                boxShadow: "0 0 30px color-mix(in oklab, var(--mint) 10%, transparent)",
+              }}
+            >
+              <div
+                className="flex h-10 w-10 items-center justify-center rounded-lg"
+                style={{
+                  background: "color-mix(in oklab, var(--mint) 18%, transparent)",
+                  color: "var(--mint)",
+                }}
+              >
+                <FileVideo className="h-5 w-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-medium">
+                  {activePayload.mediaPath.split("/").pop()}
+                </p>
+                <p className="text-xs" style={{ opacity: 0.65 }}>
+                  {PLATFORM_LABELS[activePayload.platform]}
+                </p>
+              </div>
+              {submitting && (
+                <div className="flex items-center gap-2 text-sm" style={{ opacity: 0.75 }}>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Simulating…
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              {error && (
+                <div
+                  className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-2 text-sm text-destructive"
+                  role="alert"
+                >
+                  {error}
+                </div>
+              )}
+              <ContentUploader
+                onSubmit={handleSubmit}
+                defaults={{
+                  goal:
+                    profile?.primary_goal && profile.primary_goal !== "other"
+                      ? (profile.primary_goal as Goal)
+                      : undefined,
+                  audienceDescription: profile?.audience_description ?? undefined,
+                  audienceTags: audienceTagsForCreatorType(profile?.creator_type ?? null),
+                }}
+                showDefaultsNote={
+                  !!(
+                    profile?.primary_goal ||
+                    profile?.audience_description ||
+                    profile?.creator_type
+                  )
+                }
+              />
+            </>
+          )}
+        </div>
+
+        {phase.kind === "result" && (
+          <div className="mt-8 animate-in fade-in duration-500">
+            <div className="grid gap-6 lg:grid-cols-5">
+              {/* Left column ~60% */}
+              <div className="flex flex-col items-stretch gap-6 lg:col-span-3 [&>*]:w-full">
+                <ViralityScoreCard
+                  score={phase.score}
+                  verdict={phase.verdict}
+                  confidence={phase.confidence}
+                />
+                <EstimatedReachCard
+                  reach_low={phase.reachLow}
+                  reach_high={phase.reachHigh}
+                  platform_label={PLATFORM_LABELS[phase.payload.platform]}
+                />
+                <AudienceResponseCard
+                  goal={phase.payload.goal ?? null}
+                  metrics={phase.metrics}
+                  personas={phase.personas}
+                />
+              </div>
+              {/* Right column ~40% */}
+              <div className="flex flex-col items-stretch gap-6 lg:col-span-2 [&>*]:w-full">
+                {phase.recommendations.length > 0 && (
+                  <RecommendationsCard recommendations={phase.recommendations} />
+                )}
+                {phase.patterns.length > 0 && (
+                  <ReferencePatternsCard
+                    patterns={phase.patterns}
+                    platformLabel={PLATFORM_LABELS[phase.payload.platform]}
+                  />
+                )}
+                {phase.similarReferences.length > 0 && (
+                  <SimilarReferencesCard references={phase.similarReferences} />
+                )}
+              </div>
+            </div>
+            <div className="mt-8 flex justify-center">
+              <Button
+                variant="outline"
+                onClick={reset}
+                className="border-white/20 bg-transparent text-white hover:bg-white/10 hover:text-white"
+              >
+                Run another simulation
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+    </main>
+  );
+}
